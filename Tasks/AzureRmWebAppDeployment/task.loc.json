@@ -9,6 +9,7 @@
     "Build",
     "Release"
   ],
+  "preview": "true",
   "runsOn": [
     "Agent",
     "DeploymentGroup"
