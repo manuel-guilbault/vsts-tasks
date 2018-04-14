@@ -45,6 +45,15 @@ export async function installCertInTemporaryKeychain(keychainPath: string, keych
     importP12Command.arg(['import', p12CertPath, '-P', p12Pwd, '-A', '-t', 'cert', '-f', 'pkcs12', '-k', keychainPath]);
     await importP12Command.exec();
 
+    //For existing keychains like login.keychain, set the partition_id ACL for the private key.
+    //if we created a temporary keychain, this step is unnecessary.
+    if (!setupKeychain) {
+        const privateKeyName: string = await getP12PrivateKeyName(p12CertPath, p12Pwd);
+        await setKeyPartitionList(privateKeyName, keychainPath, keychainPwd);
+    } else {
+        tl.debug('Skip setting the partition_id for new keychain.');
+    }
+
     //list the keychains to get current keychains in search path
     let listAllOutput: string;
     let listAllCommand: ToolRunner = tl.tool(tl.which('security', true));
@@ -606,4 +615,78 @@ export async function deleteCert(keychainPath: string, certSha1Hash: string) {
     let deleteCert: ToolRunner = tl.tool(tl.which('security', true));
     deleteCert.arg(['delete-certificate', '-Z', certSha1Hash, keychainPath]);
     await deleteCert.exec();
+}
+
+async function getP12PrivateKeyName(p12Path: string, p12Pwd: string): Promise<string> {
+    //openssl pkcs12 -in <p12Path> -nocerts -passin pass:"<p12Pwd>" -passout pass:"<p12Pwd>" | grep 'friendlyName'
+    //We pipe through grep so we we don't log the private key, even encrypted.
+    tl.debug('getting the P12 private key name');
+    let opensslPath: string = tl.which('openssl', true);
+    let openssl: ToolRunner = tl.tool(opensslPath);
+    if (!p12Pwd) {
+        // if password is null or not defined, set it to empty
+        p12Pwd = '';
+    }
+    openssl.arg(['pkcs12', '-in', p12Path, '-nocerts', '-passin', 'pass:' + p12Pwd, '-passout', 'pass:' + p12Pwd]);
+
+    let grepPath: string = tl.which('grep', true);
+    let grep: ToolRunner = tl.tool(grepPath);
+    grep.arg(['friendlyName']);
+    openssl.pipeExecOutputToTool(grep);
+
+    let privateKeyName: string;
+    openssl.on('stdline', function (line: string) {
+        if (line) {
+            const match = line.match(/friendlyName: (.*)/);
+            if (match && match[1]) {
+                privateKeyName = match[1].trim();
+            }
+        }
+    });
+
+    await openssl.exec();
+    tl.debug('P12 private key name = ' + privateKeyName);
+    if (!privateKeyName) {
+        throw tl.loc('P12PrivateKeyNameNotFound', p12Path);
+    }
+
+    return privateKeyName;
+}
+
+/**
+ * Set the partition_id ACL so codesign has permission to use the signing key.
+ */
+async function setKeyPartitionList(privateKeyName: string, keychainPath: string, keychainPwd: string) {
+    // security set-key-partition-list -S apple-tool:,apple: -s -l <privateKeyName> -k <keychainPwd> <keychainPath>
+    // n.b. This command could update multiple keys (e.g. an expired signing key and a newer signing key.)
+
+    if (privateKeyName) {
+        tl.debug(`Setting the partition_id ACL for ${privateKeyName}`);
+
+        //https://stackoverflow.com/questions/39868578/security-codesign-in-sierra-keychain-ignores-access-control-settings-and-ui-p
+        // "apple-tool:" is typically already present. "apple:" is needed for codesign to sign non-interactively on High Sierra.
+        const partitionList = 'apple-tool:,apple:';
+
+        let setKeyCommand: ToolRunner = tl.tool(tl.which('security', true));
+        setKeyCommand.arg(['set-key-partition-list', '-S', partitionList, '-s', '-l', privateKeyName, '-k', keychainPwd, keychainPath]);
+
+        // Watch for "unknown command". set-key-partition-list was added in Sierra (macOS v10.12)
+        let unknownCommandErrorFound: boolean;
+        setKeyCommand.on('errline', (line: string) => {
+            if (!unknownCommandErrorFound && line.includes('security: unknown command')) {
+                unknownCommandErrorFound = true;
+            }
+        });
+
+        try {
+            await setKeyCommand.exec();
+        } catch (err) {
+            if (unknownCommandErrorFound) {
+                // If we're on an older OS, we don't need to run set-key-partition-list.
+                tl.warning(tl.loc('SetKeyPartitionListCommandNotFound'));
+            } else {
+                throw err;
+            }
+        }
+    }
 }
